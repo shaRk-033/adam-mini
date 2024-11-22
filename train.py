@@ -401,7 +401,7 @@ def load_binary_files(directory, pattern="fineweb_train_*.bin", val_pattern="fin
     
     return train_data, val_data
 
-data_dir = "path/to/your/binary/files" 
+data_dir ="" 
 train_data, val_data = load_binary_files(data_dir)
 
 train_data = torch.from_numpy(train_data).long()
