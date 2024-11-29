@@ -157,14 +157,17 @@ class AdamMini(Optimizer):
 
 class Config:
     vocab_size = 50304
-    d_model = 1024
-    batch_size = 512
-    context_length = 32
-    n_heads = 8
+    d_model = 768
+    batch_size = 16
+    context_length = 1024
+    n_heads = 6
     n_layers = 8
-    learning_rate = 0.0001
-    weight_decay = 1e-5
+    learning_rate = 1e-4
+    weight_decay = 0.01
     max_epochs = 3000
+    dropout = 0.1
+    bias = False
+    dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 
 config = Config()
 
@@ -239,9 +242,9 @@ class SelfAttn(nn.Module):
         super().__init__()
         self.n = config.n_heads
         self.h = config.d_model // self.n
-        self.wq = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.wk = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.wv = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.wq = nn.Linear(config.d_model, config.d_model)
+        self.wk = nn.Linear(config.d_model, config.d_model)
+        self.wv = nn.Linear(config.d_model, config.d_model)
         self.wo = nn.Linear(config.d_model, config.d_model)
         self.wo.flag = 1
         self.rotary = Rotary(config.d_model // config.n_heads)
@@ -266,8 +269,8 @@ class SelfAttn(nn.Module):
 class FFN(nn.Module):
     def __init__(self, config):
         super(FFN, self).__init__()
-        self.w1 = nn.Linear(config.d_model, config.d_model * 4, bias=False)
-        self.w2 = nn.Linear(config.d_model * 4, config.d_model, bias=False)
+        self.w1 = nn.Linear(config.d_model, config.d_model * 4)
+        self.w2 = nn.Linear(config.d_model * 4, config.d_model)
         self.act = ReLUSquared()
         self.w2.flag = 1
 
@@ -362,10 +365,10 @@ optimizer = AdamMini(
     weight_decay=config.weight_decay 
 )
 
-warmup_steps = 1000  
-max_steps = 3000     
-max_lr = config.learning_rate  
-min_lr = 0.0         
+warmup_steps = 2000
+max_steps = 3000
+max_lr = 0.00059
+min_lr = 0.0
 
 def get_lr(it):
     if it < warmup_steps:
@@ -382,6 +385,7 @@ def get_lr(it):
 def train(model, opt, config, epochs=3000, grad_accum_steps=2):
     losses = []
     log_file = f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    scaler = torch.cuda.amp.GradScaler(enabled=(torch.cuda.is_available() and config.dtype == 'float16'))
     
     def log_metrics(epoch, train_loss, val_loss=None, tokens_per_sec=None, mfu=None, grad_norm=None):
         if master:
@@ -398,7 +402,7 @@ def train(model, opt, config, epochs=3000, grad_accum_steps=2):
 
     for epoch in range(epochs):
         model.train()
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True) 
         
         cumulative_loss = torch.zeros(1, device=device)
         start_time = time.time()
@@ -406,31 +410,38 @@ def train(model, opt, config, epochs=3000, grad_accum_steps=2):
         for step in range(grad_accum_steps):
             x, y = get_batch('train')
             x, y = x.to(device), y.to(device)
-            with torch.cuda.amp.autocast():
+            
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 y_pred, loss = model(x, y)
-            loss = loss / grad_accum_steps
+                loss = loss / grad_accum_steps
+            
             cumulative_loss += loss.detach()
             torch.cuda.synchronize()
-
+            
             if ddp:
-                model_clone.require_backward_grad_sync = step == grad_accum_steps - 1
-            loss.backward()
+                model_clone.require_backward_grad_sync = (step == grad_accum_steps - 1)
+            
+            scaler.scale(loss).backward()
 
-        grad_norm = torch.zeros(1, device=device)
+        scaler.step(opt)
+        scaler.update()
+        
+        grad_norm = 0.0
         for p in model_clone.parameters():
             if p.grad is not None:
-                grad_norm += p.grad.data.norm(2).item() ** 2
-        grad_norm = grad_norm.sqrt()
+                grad_norm += torch.sum(p.grad.data ** 2).item()
+        grad_norm = math.sqrt(grad_norm)
+
+        if ddp:
+            grad_norm = torch.tensor([grad_norm], device=device)
+            dist.all_reduce(grad_norm, op=dist.ReduceOp.AVG)
+            grad_norm = grad_norm.item()
 
         if ddp:
             dist.all_reduce(cumulative_loss, op=dist.ReduceOp.AVG)
-            dist.all_reduce(grad_norm, op=dist.ReduceOp.AVG)
             torch.distributed.barrier()
 
-        torch.cuda.synchronize()
-        opt.step()
-
-        current_step = epoch * grad_accum_steps + step
+        current_step = epoch * grad_accum_steps
         for param_group in opt.param_groups:
             param_group['lr'] = get_lr(current_step)
 
@@ -453,17 +464,17 @@ def train(model, opt, config, epochs=3000, grad_accum_steps=2):
                 train_loss=cumulative_loss.item(),
                 val_loss=val_loss.item(),
                 tokens_per_sec=tokens_per_sec,
-                grad_norm=grad_norm.item()
+                grad_norm=grad_norm
             )
             
             losses.append({
                 'train': cumulative_loss.item(),
                 'val': val_loss.item(),
                 'tokens_per_sec': tokens_per_sec,
-                'grad_norm': grad_norm.item()
+                'grad_norm': grad_norm
             })
 
-        torch.cuda.empty_cache()  
+        torch.cuda.empty_cache()
 
     return pd.DataFrame(losses).plot()
 
@@ -522,8 +533,4 @@ try:
     raise e
 except Exception as e:
     print(f"Training failed: {e}")
-
-# Destroy the process group if using DDP
-if ddp:
-    destroy_process_group()
 
