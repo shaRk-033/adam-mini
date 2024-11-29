@@ -2,71 +2,18 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.optim import Optimizer
 import time
 import os
 import numpy as np
 import pandas as pd
 from datasets import load_dataset
-import tiktoken
-from adam_mini import Adam_mini
 import math
 from datetime import datetime
 from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-
-# with open('input.txt', 'r') as f:
-#     data = f.read()
-
-# vocab = sorted(list(set(data)))
-# encode = {char: i for i, char in enumerate(vocab)}
-# decode = {i: char for i, char in enumerate(vocab)}
-# enc_data = [encode[char] for char in data]
-# ds = load_dataset("HuggingFaceTB/cosmopedia-100k", split="train")
-# tokenizer = tiktoken.get_encoding('gpt2')
-
-class miniDataLoader:
-    def __init__(self, config, data, process_rank, num_processes, is_train=True) -> None:
-        self.bs = config.batch_size
-        self.length = config.context_length
-        self.data = data
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.is_train = is_train
-        self.valid_indices = len(data) - self.length - 1
-        
-        # for distributed training, split indices among processes
-        self.indices_per_process = self.valid_indices // num_processes
-        self.start_idx = self.indices_per_process * process_rank
-        self.end_idx = self.start_idx + self.indices_per_process
-        
-        self.current_idx = self.start_idx
-        self.indices = None
-        self.shuffle_data()
-        
-    def shuffle_data(self):
-        if self.is_train:
-            indices = torch.arange(self.start_idx, self.end_idx)
-            self.indices = indices[torch.randperm(len(indices))]
-        else:
-            self.indices = torch.arange(self.start_idx, self.end_idx)
-        self.current_idx = 0
-    
-    def get_data(self):
-        B = self.bs
-        T = self.length
-        
-        if self.current_idx + B >= len(self.indices):
-            self.shuffle_data()
-            
-        batch_starts = self.indices[self.current_idx:self.current_idx + B]
-        
-        x = torch.stack([self.data[i:i+T] for i in batch_starts])
-        y = torch.stack([self.data[i+1:i+T+1] for i in batch_starts])
-        
-        self.current_idx += B
-        return x, y
 
 #------------------------------------------------------------------------------------------------
 
@@ -77,13 +24,12 @@ import torch.distributed as dist
 ddp = int(os.environ.get('RANK', -1)) != -1
 
 if ddp:
-
     assert torch.cuda.is_available()
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ.get('RANK'))
     ddp_world_size = int(os.environ.get('WORLD_SIZE'))
     ddp_local_rank = int(os.environ.get('LOCAL_RANK'))
-    device = f'cuda:{ddp_local_rank}'
+    device = torch.device(f'cuda:{ddp_local_rank}')
     torch.cuda.set_device(device)
     master = ddp_rank == 0
 
@@ -92,23 +38,164 @@ else:
     ddp_world_size = 1
     ddp_local_rank = 0
     master = True
-    device = "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
-        device = "cuda"
         print(f"Using {device}")
 
 #-----------------------------------DDP----------------------------------------------------------
+class AdamMini(Optimizer):
+
+    def __init__(self, model, vocab_size, n_heads, lr=0.00059, beta1=0.9, beta2=0.999,
+                 weight_decay=0.0, eps=1e-8):
+        self.model = model
+        self.vocab_size = vocab_size 
+        self.n_heads = n_heads
+        self.lr = lr
+        self.beta1, self.beta2 = beta1, beta2
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.step_count = 0
+        self.state_dict_custom = self._init_state() 
+
+        super(AdamMini, self).__init__(model.parameters(), {})
+
+    def _init_state(self):
+        state = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                state[name] = {
+                    'm': torch.zeros_like(param, memory_format=torch.preserve_format),  
+                    'v': torch.zeros_like(param, memory_format=torch.preserve_format), 
+                    'step': 0
+                }
+        return state
+
+    def _update_param_block(self, param_data, grad, m, v):
+        m_new = (1 - self.beta1) * grad + self.beta1 * m
+        corrected_beta1 = 1 - (self.beta1 ** (self.step_count + 1))
+        momentum = m_new / corrected_beta1
+
+        v_new = (1 - self.beta2) * (grad * grad).mean() + self.beta2 * v
+        corrected_beta2 = 1 - (self.beta2 ** (self.step_count + 1))
+        velocity = v_new / corrected_beta2
+
+        update = momentum / (torch.sqrt(velocity) + self.eps)
+        param_data.add_(-self.lr * update)
+        if self.weight_decay > 0:
+            param_data.add_(-self.lr * self.weight_decay * param_data)
+            
+        return m_new, v_new
+
+    @torch.no_grad()
+    def step(self):
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+
+            state = self.state_dict_custom[name]
+            
+            if 'emb' in name or ('output' in name and 'output_rms' not in name):
+                for i in range(self.vocab_size):
+                    grad = param.grad[i] if param.grad.dim() == 1 else param.grad[i, :]
+                    m = state['m'][i] if state['m'].dim() == 1 else state['m'][i, :]
+                    v = state['v'][i] if state['v'].dim() == 1 else state['v'][i, :]
+                    
+                    m_new, v_new = self._update_param_block(param.data[i], grad, m, v)
+                    
+                    if state['m'].dim() == 1:
+                        state['m'][i] = m_new
+                        state['v'][i] = v_new
+                    else:
+                        state['m'][i, :] = m_new
+                        state['v'][i, :] = v_new
+            
+            elif 'query' in name or 'key' in name:
+                head_size = param.shape[-1] // self.n_heads
+                for i in range(self.n_heads):
+                    slice_idx = slice(i * head_size, (i + 1) * head_size)
+                    grad = param.grad[slice_idx]
+                    m, v = state['m'][slice_idx], state['v'][slice_idx]
+                    
+                    m_new, v_new = self._update_param_block(
+                        param.data[slice_idx], grad, m, v
+                    )
+                    state['m'][slice_idx] = m_new
+                    state['v'][slice_idx] = v_new
+            
+            elif any(x in name for x in ['value', 'proj', 'mlp']):
+                for i in range(param.shape[-1]):
+                    grad = param.grad[:, i]
+                    m, v = state['m'][:, i], state['v'][:, i]
+                    
+                    m_new, v_new = self._update_param_block(
+                        param.data[:, i], grad, m, v
+                    )
+                    state['m'][:, i] = m_new
+                    state['v'][:, i] = v_new
+            
+            else:
+                m_new, v_new = self._update_param_block(
+                    param.data, param.grad, state['m'], state['v']
+                )
+                state['m'] = m_new
+                state['v'] = v_new
+            
+            state['step'] += 1
+        
+        self.step_count += 1
+
+    def state_dict(self):
+        for state in self.state_dict_custom.values():
+            dist.all_reduce(state['m'], op=dist.ReduceOp.SUM)
+            dist.all_reduce(state['v'], op=dist.ReduceOp.SUM)
+            state['m'] /= dist.get_world_size()
+            state['v'] /= dist.get_world_size()
+        return self.state_dict_custom
+
+    def load_state_dict(self, state_dict):
+        self.state_dict_custom = state_dict
 
 class Config:
     vocab_size = 50304
     d_model = 1024
-    batch_size = 32
-    context_length = 64
+    batch_size = 512
+    context_length = 32
     n_heads = 8
-    n_groups = 4
     n_layers = 8
+    learning_rate = 0.0001
+    weight_decay = 1e-5
+    max_epochs = 3000
 
 config = Config()
+
+class Rotary(nn.Module):
+
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        assert x.ndim == 4 
+        d = x.shape[3] // 2
+        x1 = x[..., :d]
+        x2 = x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat([y1, y2], 3).type_as(x)
 
 # arXiv:2104.09864v5
 class RMSNorm(nn.Module):
@@ -117,9 +204,10 @@ class RMSNorm(nn.Module):
         self.g = nn.Parameter(torch.ones(config.d_model)) 
         self.alpha = 0.99
         self.eps = 1e-8
+
     def forward(self, x):
         B, T, C = x.shape
-        rms = (torch.mean(x**2, dim = -1, keepdim = True))**0.5
+        rms = (torch.mean(x**2, dim=-1, keepdim=True))**0.5
         x = x / (rms + self.eps)
         x = self.g * x
         return x
@@ -128,10 +216,10 @@ class RMSNorm(nn.Module):
 class FFN_SwiGLU(nn.Module):
     def __init__(self, d_model) -> None:
         super(FFN_SwiGLU, self).__init__()
-        self.w1 = nn.Linear(d_model, d_model*4, bias = False)
-        self.w2 = nn.Linear(d_model * 4, d_model, bias = False)
+        self.w1 = nn.Linear(d_model, d_model * 4, bias=False)
+        self.w2 = nn.Linear(d_model * 4, d_model, bias=False)
         self.beta = nn.Parameter(torch.ones(1))
-        self.v = nn.Linear(d_model, d_model * 4, bias = False)
+        self.v = nn.Linear(d_model, d_model * 4, bias=False)
 
     def forward(self, x):
         var1 = self.w1(x)
@@ -140,7 +228,6 @@ class FFN_SwiGLU(nn.Module):
         gate_out = swish * var2
         x = self.w2(gate_out)
         return x
-
 
 class ReLUSquared(nn.Module):
     def forward(self, x):
@@ -152,53 +239,35 @@ class SelfAttn(nn.Module):
         super().__init__()
         self.n = config.n_heads
         self.h = config.d_model // self.n
-        self.q = nn.Linear(config.d_model, config.d_model, bias = False)
-        self.k = nn.Linear(config.d_model, config.d_model, bias = False)
-        self.v = nn.Linear(config.d_model, config.d_model, bias = False)
-        self.o = nn.Linear(config.d_model, config.d_model)
-        self.o.flag = 1
-        self.cos, self.sin = self.get_rotary_matrix(config)
-
-    def get_rotary_matrix(self, config):
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, config.d_model, 2, device=device).float() / config.d_model))
-        position = torch.arange(0, config.context_length, device=device).float()
-        sinusoid_inp = torch.einsum("i,j->ij", position, inv_freq)
-        sin = sinusoid_inp.sin()
-        cos = sinusoid_inp.cos()
-        sin = sin.repeat(config.n_heads, 1)
-        cos = cos.repeat(config.n_heads, 1)
-        return cos, sin
+        self.wq = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.wk = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.wv = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.wo = nn.Linear(config.d_model, config.d_model)
+        self.wo.flag = 1
+        self.rotary = Rotary(config.d_model // config.n_heads)
+        self.wo.weight.data.zero_()
 
     def forward(self, x):
-        b,t,c = x.shape
-        q = self.q(x)
-        k = self.k(x)
-        v = self.v(x)
-        n = self.n
-        h = self.h
+        B, T, C = x.size()
 
-        q_rotated = (q * self.cos) + (self.rotate_half(q) * self.sin)
-        k_rotated = (k * self.cos) + (self.rotate_half(k) * self.sin)
+        q = self.wq(x).view(B, T, self.n, self.h).transpose(1, 2)  # (B, n, T, h)
+        k = self.wk(x).view(B, T, self.n, self.h).transpose(1, 2)
+        v = self.wv(x).view(B, T, self.n, self.h).transpose(1, 2)
 
-        q = q_rotated.view(b, t, n, h).transpose(1, 2)
-        k = k_rotated.view(b, t, n, h).transpose(1, 2)
-        v = v.view(b, t, n, h).transpose(1, 2)
+        q, k = self.rotary(q), self.rotary(k)
+        # Flash Attention
+        att_val = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p= 0, is_causal=True)
-
-        attn = attn.transpose(1, 2).contiguous().view(b, t, c)
-        return attn
-
-    def rotate_half(self, x):
-        x = x.view(*x.shape[:-1], -1, 2)
-        x1, x2 = x[...,0], x[...,1]
-        return torch.cat((-x2, x1), dim=-1)
+        # Concatenate multiple heads
+        attention = att_val.transpose(1, 2).contiguous().view(B, T, C)
+        final = self.wo(attention)
+        return final
 
 class FFN(nn.Module):
     def __init__(self, config):
         super(FFN, self).__init__()
-        self.w1 = nn.Linear(config.d_model, config.d_model * 4, bias = False)
-        self.w2 = nn.Linear(config.d_model * 4, config.d_model, bias = False)
+        self.w1 = nn.Linear(config.d_model, config.d_model * 4, bias=False)
+        self.w2 = nn.Linear(config.d_model * 4, config.d_model, bias=False)
         self.act = ReLUSquared()
         self.w2.flag = 1
 
@@ -215,6 +284,7 @@ class DecoderLayer(nn.Module):
         self.rmsn1 = RMSNorm(config)
         self.ffn = FFN(config)
         self.rmsn2 = RMSNorm(config)
+
     def forward(self, x):
         x1 = self.attn(self.rmsn1(x)) + x
         x2 = self.ffn(self.rmsn2(x1)) + x1
@@ -229,7 +299,7 @@ class Gpt(nn.Module):
         self.final_rms = RMSNorm(config)
         self.final = nn.Linear(config.d_model, config.vocab_size)
         print("Number of params: ", sum(p.numel() for p in self.parameters()))
-
+        self.final.weight.data.zero_()
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -238,13 +308,13 @@ class Gpt(nn.Module):
             # for every residual connection we scale the weights by 1/sqrt(2*n_layers) so as to prevent the variance go boom
             if hasattr(module, 'flag') and module.flag == 1:
                 std *= (2 * self.config.n_layers) ** -0.5
-            module.weight.data.normal_(mean = 0.0, std = std)
+            module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
         if isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean = 0.0, std = 0.02)
+            module.weight.data.normal_(mean=0.0, std=0.02)
 
-    def forward(self, x, targets = None):
+    def forward(self, x, targets=None):
         x = self.emb(x)
         for layer in self.layers:
             x = layer(x)
@@ -255,6 +325,7 @@ class Gpt(nn.Module):
             return x, loss
         else:
             return x
+
     def generate(self, start_prompt, tokenizer, max_length=100):
         self.eval()
         input_ids = tokenizer.encode(start_prompt)
@@ -275,53 +346,55 @@ class Gpt(nn.Module):
         return generated_text
 
 model = Gpt(config).to(device)
-model = torch.compile(model, fullgraph=True, mode='reduce-overhead')
+model = torch.compile(model)
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
-model_clone = model.module if ddp else model
+    model_clone = model.module
+else:
+    model_clone = model
 
-# opt = optim.Adam(model.parameters(), lr=0.001)
-optimizer = Adam_mini(
-            named_parameters = model.named_parameters(),
-            lr = 0.001,
-            betas = (0.9, 0.95),
-            eps = 1e-8,
-            dim = config.d_model,
-            n_heads = config.n_heads,
-            )
+optimizer = AdamMini(
+    model_clone,
+    config.vocab_size,
+    config.n_heads,
+    lr=config.learning_rate,      
+    weight_decay=config.weight_decay 
+)
 
-def calculate_mfu(model, config, tokens_per_sec):
-    N = sum(p.numel() for p in model.parameters())
-    L = config.n_layers
-    H = config.d_model
-    Q = config.context_length
-    B = config.batch_size
+warmup_steps = 1000  
+max_steps = 3000     
+max_lr = config.learning_rate  
+min_lr = 0.0         
+
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
     
-    flops_per_token = 6*N + 12*L*H*Q
-    flops_per_batch = flops_per_token * B
-    flops_per_sec = flops_per_batch * tokens_per_sec
-    theoretical_flops = torch.cuda.get_device_properties(0).multi_processor_count * 1e12  # A100 theoretical FLOPS
-    mfu = flops_per_sec / theoretical_flops
-    return mfu
+    if it > max_steps:
+        return min_lr
+    
+    decay_rate = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_rate <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_rate)) 
+    return min_lr + coeff * (max_lr - min_lr)
 
-def train(train_loader, val_loader, model, opt, config, epochs=3000, grad_accum_steps=4):
+def train(model, opt, config, epochs=3000, grad_accum_steps=2):
     losses = []
     log_file = f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     
     def log_metrics(epoch, train_loss, val_loss=None, tokens_per_sec=None, mfu=None, grad_norm=None):
-        with open(log_file, 'a') as f:
-            log_line = f"Epoch {epoch} | Train loss: {train_loss:.4f}"
-            if val_loss is not None:
-                log_line += f" | Val loss: {val_loss:.4f}"
-            if tokens_per_sec is not None:
-                log_line += f" | Tokens/sec: {tokens_per_sec:.2f}"
-            if mfu is not None:
-                log_line += f" | MFU: {mfu:.2%}"
-            if grad_norm is not None:
-                log_line += f" | Grad norm: {grad_norm:.4f}"
-            f.write(log_line + "\n")
-            print(log_line)
+        if master:
+            with open(log_file, 'a') as f:
+                log_line = f"Step {epoch} | Train loss: {train_loss:.4f}"
+                if val_loss is not None:
+                    log_line += f" | Val loss: {val_loss:.4f}"
+                if tokens_per_sec is not None:
+                    log_line += f" | Tokens/sec: {tokens_per_sec:.2f}"
+                if grad_norm is not None:
+                    log_line += f" | Grad norm: {grad_norm:.4f}"
+                f.write(log_line + "\n")
+                print(log_line)
 
     for epoch in range(epochs):
         model.train()
@@ -330,45 +403,56 @@ def train(train_loader, val_loader, model, opt, config, epochs=3000, grad_accum_
         cumulative_loss = torch.zeros(1, device=device)
         start_time = time.time()
 
-        x, y = train_loader.get_data()
-        x, y = x.to(device), y.to(device)
-
         for step in range(grad_accum_steps):
-            y_pred, loss = model(x, y)
+            x, y = get_batch('train')
+            x, y = x.to(device), y.to(device)
+            with torch.cuda.amp.autocast():
+                y_pred, loss = model(x, y)
             loss = loss / grad_accum_steps
             cumulative_loss += loss.detach()
+            torch.cuda.synchronize()
 
             if ddp:
                 model_clone.require_backward_grad_sync = step == grad_accum_steps - 1
             loss.backward()
 
+        grad_norm = torch.zeros(1, device=device)
+        for p in model_clone.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.data.norm(2).item() ** 2
+        grad_norm = grad_norm.sqrt()
+
         if ddp:
             dist.all_reduce(cumulative_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(grad_norm, op=dist.ReduceOp.AVG)
+            torch.distributed.barrier()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model_clone.parameters(), 1.0)
+        torch.cuda.synchronize()
         opt.step()
-        
-        tokens_per_batch = config.batch_size * config.context_length
+
+        current_step = epoch * grad_accum_steps + step
+        for param_group in opt.param_groups:
+            param_group['lr'] = get_lr(current_step)
+
+        tokens_per_batch = config.batch_size * config.context_length * grad_accum_steps
         elapsed = time.time() - start_time
         tokens_per_sec = tokens_per_batch / elapsed
-        
-        mfu = calculate_mfu(model, config, tokens_per_sec)
 
         if epoch % 10 == 0:
             model.eval()
             with torch.no_grad():
-                val_x, val_y = val_loader.get_data()
+                val_x, val_y = get_batch('val')
                 val_x, val_y = val_x.to(device), val_y.to(device)
                 _, val_loss = model(val_x, val_y)
                 if ddp:
                     dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                    torch.distributed.barrier()
             
             log_metrics(
                 epoch=epoch,
                 train_loss=cumulative_loss.item(),
                 val_loss=val_loss.item(),
                 tokens_per_sec=tokens_per_sec,
-                mfu=mfu,
                 grad_norm=grad_norm.item()
             )
             
@@ -376,56 +460,70 @@ def train(train_loader, val_loader, model, opt, config, epochs=3000, grad_accum_
                 'train': cumulative_loss.item(),
                 'val': val_loss.item(),
                 'tokens_per_sec': tokens_per_sec,
-                'mfu': mfu,
                 'grad_norm': grad_norm.item()
             })
 
-        torch.cuda.synchronize()
+        torch.cuda.empty_cache()  
 
     return pd.DataFrame(losses).plot()
 
-def load_binary_files(directory, pattern="fineweb_train_*.bin", val_pattern="fineweb_val_*.bin"):
-    def load_files(pattern):
-        data = []
-        for file_path in sorted(Path(directory).glob(pattern)):
-            print(f"Loading {file_path.name}...")
-            chunk = np.memmap(file_path, dtype=np.uint16, mode='r') 
-            data.append(chunk)
-        return np.concatenate(data) if data else None
+data_dir = "./fineweb10B"
 
-    train_data = load_files(pattern)
-    val_data = load_files(val_pattern)
+def get_batch(split):
+    if split == 'train':
+        file_path = os.path.join(data_dir, "train.bin")
+    else:
+        file_path = os.path.join(data_dir, "val.bin")
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"{file_path} does not exist. Please ensure you've combined the binary files.")
     
-    print(f"Loaded training data: {train_data.shape if train_data is not None else 'None'}")
-    print(f"Loaded validation data: {val_data.shape if val_data is not None else 'None'}")
-    
-    return train_data, val_data
+    dtype = np.uint16  
+    data = np.memmap(file_path, dtype=dtype, mode='r')
 
-data_dir ="" 
-train_data, val_data = load_binary_files(data_dir)
+    if len(data) < config.context_length + 1:
+        raise ValueError(f"File {file_path} is too small for context length {config.context_length}")
 
-train_data = torch.from_numpy(train_data).long()
-val_data = torch.from_numpy(val_data).long()
+    ix = torch.randint(0, len(data) - config.context_length - 1, (config.batch_size,))
+    x = torch.stack([torch.from_numpy(data[i:i+config.context_length].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i+1:i+1+config.context_length].astype(np.int64)) for i in ix])
 
-train_loader = miniDataLoader(config, train_data, ddp_rank, ddp_world_size, is_train=True)
-val_loader = miniDataLoader(config, val_data, ddp_rank, ddp_world_size, is_train=False)
+    # if master:
+    #     print(f"Batch min value: x={x.min().item()}, y={y.min().item()}")
+    #     print(f"Batch max value: x={x.max().item()}, y={y.max().item()}")
+    # Verification
+    # if torch.any(x >= config.vocab_size) or torch.any(y >= config.vocab_size):
+    #     raise ValueError("Token index out of bounds in the batch. Please check your data preprocessing.")
 
+    if device.type == 'cuda':
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+
+    return x, y
 
 # def verify_data_loading():
 #     print("Verifying data loading...")
-#     x, y = train_loader.get_data()
+#     x, y = get_batch('train')
 #     print(f"Training batch shape - x: {x.shape}, y: {y.shape}")
 #     print(f"Training data sample values - min: {x.min()}, max: {x.max()}")
-    
-#     x, y = val_loader.get_data()
-#     print(f"Validation batch shape - x: {x.shape}, y: {y.shape}")
-#     print(f"Validation data sample values - min: {x.min()}, max: {x.max()}")
 
 # verify_data_loading()
 
+# After training, save the model in a popular format
+def save_model(model, model_name="my_model.pt"):
+    torch.save(model.state_dict(), model_name) 
+
 try:
-    train(train_loader, val_loader, model, optimizer, config)
-except RuntimeError as e:
+    train(model, optimizer, config)
+    save_model(model_clone, model_name="adamGpt.pt")  
     if "out of memory" in str(e):
         print("CUDA out of memory. Try reducing batch size or model size.")
     raise e
+except Exception as e:
+    print(f"Training failed: {e}")
+
+# Destroy the process group if using DDP
+if ddp:
+    destroy_process_group()
+
