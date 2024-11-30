@@ -195,21 +195,6 @@ class AdamMini(Optimizer):
     def load_state_dict(self, state_dict):
         self.state_dict_custom = state_dict
 
-class Config:
-    vocab_size = 50304
-    d_model = 768
-    batch_size = 32
-    context_length = 1024
-    n_heads = 6
-    n_layers = 8
-    learning_rate = 4e-4
-    weight_decay = 0.002
-    max_epochs = 20000
-    dropout = 0.0
-    bias = False
-    dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-
-config = Config()
 
 class Rotary(nn.Module):
 
@@ -399,7 +384,23 @@ class Gpt(nn.Module):
         return generated_text
 
 
-#------------------------------------Training---------------------------------------------------
+#-----------------------------------------------------------------------------------------------
+class Config:
+    vocab_size = 50304
+    d_model = 1024
+    batch_size = 32
+    context_length = 1024
+    n_heads = 8
+    n_layers = 8
+    learning_rate = 8e-4
+    weight_decay = 0.001
+    max_epochs = 2000
+    dropout = 0.0
+    bias = False
+    dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+
+config = Config()
+
 model = Gpt(config).to(device)
 
 if ddp:
@@ -427,8 +428,8 @@ optimizer = AdamMini(
 # )
 
 print("Compilation done")
-warmup_steps = 2000
-max_steps = 200000
+warmup_steps = 1500
+max_steps = 2000
 max_lr = 8e-4
 min_lr = 0.0
 eval_iters = 10
@@ -449,7 +450,7 @@ def train(model, ctx, opt, config, epochs, grad_accum_steps=16):
     log_file = f"./logs/training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     scaler = torch.cuda.amp.GradScaler(enabled=(torch.cuda.is_available() and config.dtype == 'float16'))
     x, y = get_batch('train')
-    def log_metrics(epoch, train_loss, val_loss=None, tokens_per_sec=None, mfu=None, grad_norm=None):
+    def log_metrics(epoch, train_loss, val_loss=None, tokens_per_sec=None, mfu=None, grad_norm=None, lr=None):
         if master:
             with open(log_file, 'a') as f:
                 log_line = f"Step {epoch} | Train loss: {train_loss:.4f}"
@@ -459,6 +460,8 @@ def train(model, ctx, opt, config, epochs, grad_accum_steps=16):
                     log_line += f" | Tokens/sec: {tokens_per_sec:.2f}"
                 if grad_norm is not None:
                     log_line += f" | Grad norm: {grad_norm:.4f}"
+                if lr is not None:
+                    log_line += f" | LR: {lr:.4f}"
                 f.write(log_line + "\n")
                 print(log_line)
 
@@ -488,7 +491,6 @@ def train(model, ctx, opt, config, epochs, grad_accum_steps=16):
         scaler.step(opt)
         val_x, val_y = get_batch('val')
         scaler.update()
-
         if ddp:
             dist.all_reduce(cumulative_loss, op=dist.ReduceOp.AVG)
             torch.distributed.barrier()
@@ -509,6 +511,7 @@ def train(model, ctx, opt, config, epochs, grad_accum_steps=16):
             train_loss=cumulative_loss.item(),
             val_loss=val_loss.item(),
             tokens_per_sec=tokens_per_sec,
+            lr = get_lr(current_step)
         )
 
         torch.cuda.empty_cache()
